@@ -17,32 +17,28 @@ limitations under the License.
 package main
 
 import (
-	"os"
-	// "flag"
 	"bufio"
 	"context"
 	"fmt"
-	// "io"
 	"io/ioutil"
-	// "strings"
+	"os"
 	"time"
 
 	"k8s.io/klog/v2"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	// "github.com/spf13/viper"
-	// "github.com/davecgh/go-spew/spew"
+
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/cli"
 
 	v1 "k8s.io/api/core/v1"
-	typedv1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	// meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	// "k8s.io/apimachinery/pkg/fields"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	typed_core_v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
@@ -108,7 +104,7 @@ func (c *Controller) getPodLogs(key string) error {
 
 							scanner := bufio.NewScanner(stream)
 
-							log.Infof("container %s in pod %s failed", pod.Name, status.Name)
+							log.Infof("container %s in pod %s failed", status.Name, pod.Name)
 							for scanner.Scan() {
 								fmt.Println(scanner.Text())
 							}
@@ -153,7 +149,6 @@ func (c *Controller) Run(ctx context.Context, threadiness int) {
 	defer runtime.HandleCrash()
 
 	defer c.queue.ShutDown()
-	log.Info("Starting Pod controller")
 
 	go c.informer.Run(ctx.Done())
 
@@ -164,9 +159,17 @@ func (c *Controller) Run(ctx context.Context, threadiness int) {
 
 	go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 
+	ch := make(chan struct{})
+	go runHelmChecker(ch)
+
+	log.Info("started helm deploy checker")
+
 	select {
 	case <-ctx.Done():
-		log.Info("Stopping Pod controller")
+		log.Info("ended helm deploy checker by timeout")
+		return
+	case <-ch:
+		log.Info("ended helm deploy checker")
 		return
 	}
 }
@@ -176,19 +179,50 @@ func (c *Controller) runWorker(ctx context.Context) {
 	}
 }
 
+func runHelmChecker(ch chan struct{}) {
+	var value struct{}
+
+	settings := cli.New()
+	cfg := new(action.Configuration)
+	cfg.Init(settings.RESTClientGetter(), cliFlags.Namespace, os.Getenv("HELM_DRIVER"), nil)
+
+	list := action.NewList(cfg)
+	list.All = true
+	list.SetStateMask()
+
+	time.Sleep(15 * time.Second)
+	for {
+		releases, err := list.Run()
+		if err != nil {
+			log.Info(err)
+		} else {
+			for _, release := range releases {
+				if release.Name == cliFlags.HelmReleaseName {
+					if release.Info.Status != "pending-install" && release.Info.Status != "pending-upgrade" {
+						ch <- value
+					}
+				}
+			}
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+}
+
 type flags struct {
-	Kubeconfig string
-	Namespace  string
-	Timeout    string
-	TimeLag    string
-	Selector   string
+	Kubeconfig      string
+	Namespace       string
+	Timeout         string
+	TimeLag         string
+	Selector        string
+	HelmReleaseName string
 }
 
 var (
 	cliFlags   flags
-	podsGetter typedv1.PodInterface
+	podsGetter typed_core_v1.PodInterface
 	logOptions *v1.PodLogOptions = &v1.PodLogOptions{}
-	selector                     = func(options *metav1.ListOptions) {
+	selector                     = func(options *meta_v1.ListOptions) {
 		labelSelector, _ := labels.Parse(cliFlags.Selector)
 		options.LabelSelector = labelSelector.String()
 	}
@@ -223,6 +257,11 @@ var rootCmd = &cobra.Command{
 
 		now = time.Now().Add(-timeLag).Unix()
 
+		if cliFlags.HelmReleaseName == "" {
+			labelSelector, _ := labels.Parse(cliFlags.Selector)
+			cliFlags.HelmReleaseName, _ = labelSelector.RequiresExactMatch("app")
+		}
+
 		return nil
 	},
 }
@@ -233,6 +272,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cliFlags.TimeLag, "time-lag", "1m0s", "max lag between proccess running time and pod creation time")
 	rootCmd.PersistentFlags().StringVarP(&cliFlags.Namespace, "namespace", "n", "default", "namespace")
 	rootCmd.PersistentFlags().StringVarP(&cliFlags.Selector, "selector", "l", "", "Selector (label query) to filter on")
+	rootCmd.PersistentFlags().StringVar(&cliFlags.HelmReleaseName, "helm-release-name", "", "Helm release name for deploy state checking")
 }
 
 func main() {
