@@ -19,11 +19,12 @@ package main
 import (
 	"os"
 	// "flag"
+	"bufio"
 	"context"
 	"fmt"
-	"io"
+	// "io"
 	"io/ioutil"
-	"strings"
+	// "strings"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -88,57 +89,36 @@ func (c *Controller) getPodLogs(key string) error {
 		return err
 	}
 
-	if !exists {
-		// Below we will warm up our cache with a Pod, so that we will see a delete for one pod
-		log.Infof("Pod %s does not exist anymore\n", key)
-	} else {
-		// Note that you also have to check the uid if you have a local controlled resource, which
-		// is dependent on the actual instance, to detect that a Pod was recreated with the same name
-		// fmt.Printf("Sync/Add/Update for Pod %s\n", obj.(*v1.Pod).GetName())
-
+	if exists {
 		pod := obj.(*v1.Pod)
 
-		containerStatuses := pod.Status.ContainerStatuses
-		for _, status := range containerStatuses {
-			state := status.State
-			if state.Terminated != nil {
-				if state.Terminated.Reason != "Completed" {
-					stream, err := podsGetter.GetLogs(pod.Name, logOptions).Stream(context.TODO())
-					if err != nil {
-						return err
+		podStartTime := pod.Status.StartTime
+		if podStartTime != nil {
+			if podStartTime.Unix() > now {
+				containerStatuses := pod.Status.ContainerStatuses
+				for _, status := range containerStatuses {
+					state := status.State
+					if state.Terminated != nil {
+						if state.Terminated.Reason != "Completed" {
+							stream, err := podsGetter.GetLogs(pod.Name, logOptions).Stream(context.TODO())
+							if err != nil {
+								return err
+							}
+							defer stream.Close()
+
+							scanner := bufio.NewScanner(stream)
+
+							log.Infof("container %s in pod %s failed", pod.Name, status.Name)
+							for scanner.Scan() {
+								fmt.Println(scanner.Text())
+							}
+						}
 					}
-					defer stream.Close()
-
-					buf := new(strings.Builder)
-					io.Copy(buf, stream)
-
-					log.Info(buf.String())
 				}
 			}
 		}
 	}
 
-	return nil
-}
-
-// syncToStdout is the business logic of the controller. In this controller it simply prints
-// information about the pod to stdout. In case an error happened, it has to simply return the error.
-// The retry logic should not be part of the business logic.
-func (c *Controller) syncToStdout(key string) error {
-	obj, exists, err := c.indexer.GetByKey(key)
-	if err != nil {
-		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
-		return err
-	}
-
-	if !exists {
-		// Below we will warm up our cache with a Pod, so that we will see a delete for one pod
-		fmt.Printf("Pod %s does not exist anymore\n", key)
-	} else {
-		// Note that you also have to check the uid if you have a local controlled resource, which
-		// is dependent on the actual instance, to detect that a Pod was recreated with the same name
-		fmt.Printf("Sync/Add/Update for Pod %s\n", obj.(*v1.Pod).GetName())
-	}
 	return nil
 }
 
@@ -200,21 +180,21 @@ type flags struct {
 	Kubeconfig string
 	Namespace  string
 	Timeout    string
+	TimeLag    string
 	Selector   string
 }
 
-var cliFlags flags
-
-// var podsGetter v1.PodsGetter
-// var logOptions v1.PodLogOptions
-var podsGetter typedv1.PodInterface
-var logOptions *v1.PodLogOptions = &v1.PodLogOptions{}
-
-// var selector labels.Selector
-var selector = func(options *metav1.ListOptions) {
-	labelSelector, _ := labels.Parse(cliFlags.Selector)
-	options.LabelSelector = labelSelector.String()
-}
+var (
+	cliFlags   flags
+	podsGetter typedv1.PodInterface
+	logOptions *v1.PodLogOptions = &v1.PodLogOptions{}
+	selector                     = func(options *metav1.ListOptions) {
+		labelSelector, _ := labels.Parse(cliFlags.Selector)
+		options.LabelSelector = labelSelector.String()
+	}
+	now     int64
+	timeout time.Duration
+)
 
 var rootCmd = &cobra.Command{
 	Use:  "helm-upgrade-pod-logs",
@@ -222,36 +202,38 @@ var rootCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return execute()
 	},
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+
+		if cliFlags.Kubeconfig == "" {
+			cliFlags.Kubeconfig = os.Getenv("KUBECONFIG")
+		}
+
+		var err error
+
+		timeout, err = time.ParseDuration(cliFlags.Timeout)
+		if err != nil {
+			return err
+		}
+
+		timeLag, err := time.ParseDuration(cliFlags.TimeLag)
+		if err != nil {
+			return err
+		}
+
+		now = time.Now().Add(-timeLag).Unix()
+
+		return nil
+	},
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cliFlags.Kubeconfig, "kubeconfig", "", "path to kubeconfig")
 	rootCmd.PersistentFlags().StringVar(&cliFlags.Timeout, "timeout", "5m0s", "process timeout")
+	rootCmd.PersistentFlags().StringVar(&cliFlags.TimeLag, "time-lag", "1m0s", "max lag between proccess running time and pod creation time")
 	rootCmd.PersistentFlags().StringVarP(&cliFlags.Namespace, "namespace", "n", "default", "namespace")
 	rootCmd.PersistentFlags().StringVarP(&cliFlags.Selector, "selector", "l", "", "Selector (label query) to filter on")
-
-	if cliFlags.Kubeconfig == "" {
-		cliFlags.Kubeconfig = os.Getenv("KUBECONFIG")
-	}
-
-	// selector, _ := labels.ParseSelector(cliFlags.Selector)
-	// selector, _ = labels.Parse(cliFlags.Selector)
 }
-
-// func parseSelectors() map[string]string {
-// 	var labels map[string]string
-//
-// 	for _, selector := range strings.Split(cliFlags.Selector, ",") {
-// 		kv := strings.Split(selector, "=")
-//
-// 		spew.Dump(kv)
-// 		// labels[kv[0]] = kv[1]
-// 	}
-//
-// 	spew.Dump(labels)
-//
-// 	return labels
-// }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
@@ -277,7 +259,6 @@ func execute() error {
 
 	podsGetter = clientset.CoreV1().Pods(cliFlags.Namespace)
 
-	// podListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", cliFlags.Namespace, fields.Everything())
 	podListWatcher := cache.NewFilteredListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", cliFlags.Namespace, selector)
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
@@ -302,11 +283,6 @@ func execute() error {
 			}
 		},
 	}, cache.Indexers{})
-
-	timeout, err := time.ParseDuration(cliFlags.Timeout)
-	if err != nil {
-		return err
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
