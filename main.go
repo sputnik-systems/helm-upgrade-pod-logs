@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"os"
 	"time"
 
@@ -90,7 +91,18 @@ func (c *Controller) getPodLogs(key string) error {
 
 		podStartTime := pod.Status.StartTime
 		if podStartTime != nil {
-			if podStartTime.Unix() > now {
+			if timeStart.isValidLag(podStartTime.Unix(), timeLag) {
+				events, err := eventsGetter.List(context.TODO(), meta_v1.ListOptions{})
+				if err != nil {
+					log.Error(err)
+				} else {
+					for _, event := range events.Items {
+						if event.InvolvedObject.Name == pod.Name && event.Type == "Warning" && event.LastTimestamp.Unix() >= podStartTime.Unix() {
+							log.Infof("%s %s %s", event.Type, event.Reason, event.Message)
+						}
+					}
+				}
+
 				containerStatuses := pod.Status.ContainerStatuses
 				for _, status := range containerStatuses {
 					state := status.State
@@ -184,21 +196,26 @@ func runHelmChecker(ch chan struct{}) {
 
 	settings := cli.New()
 	cfg := new(action.Configuration)
-	cfg.Init(settings.RESTClientGetter(), cliFlags.Namespace, os.Getenv("HELM_DRIVER"), nil)
+	cfg.Init(settings.RESTClientGetter(), cliFlags.namespace, os.Getenv("HELM_DRIVER"), nil)
 
 	list := action.NewList(cfg)
 	list.All = true
 	list.SetStateMask()
 
-	time.Sleep(15 * time.Second)
 	for {
 		releases, err := list.Run()
 		if err != nil {
 			log.Info(err)
 		} else {
 			for _, release := range releases {
-				if release.Name == cliFlags.HelmReleaseName {
-					if release.Info.Status != "pending-install" && release.Info.Status != "pending-upgrade" {
+				if release.Name == cliFlags.helmReleaseName {
+					if release.Info.Status != "pending-install" &&
+						release.Info.Status != "pending-upgrade" {
+						if timeStart.isDeployOutdated(timeLag) ||
+							timeStart.isValidLag(release.Info.LastDeployed.Unix(), timeLag) {
+							break
+						}
+
 						ch <- value
 					}
 				}
@@ -209,25 +226,63 @@ func runHelmChecker(ch chan struct{}) {
 	}
 }
 
-type flags struct {
-	Kubeconfig      string
-	Namespace       string
-	Timeout         string
-	TimeLag         string
-	Selector        string
-	HelmReleaseName string
+func (t timestamp) isDeployOutdated(l float64) bool {
+	now := time.Now().Unix()
+
+	log.Debugf("start time: %d, current time: %d, delta: %d, lag time: %f", t, now, now-int64(t), l)
+
+	return float64(now-int64(t)) <= l
 }
 
+func (t timestamp) isValidLag(e int64, l float64) bool {
+	log.Debugf("start time: %d, event time: %d, delta: %d, lag time: %f", t, e, e-int64(t), l)
+
+	now := time.Now().Unix()
+
+	switch {
+	// don't check if passed less than "time lag" time
+	case float64(now-int64(t)) <= l:
+		return true
+	// delta betwen event tima and current time
+	// less than specified time lag
+	case math.Abs(float64(now-e)) <= l:
+		return true
+	default:
+		return false
+	}
+}
+
+type flags struct {
+	kubeconfig      string
+	namespace       string
+	timeout         string
+	timeLag         string
+	selector        string
+	helmReleaseName string
+}
+
+// type params struct {
+// 	timestamp timestamp
+// 	timeout   time.Duration
+// 	lag       float64
+// }
+
+type timestamp int64
+
 var (
-	cliFlags   flags
-	podsGetter typed_core_v1.PodInterface
-	logOptions *v1.PodLogOptions = &v1.PodLogOptions{}
-	selector                     = func(options *meta_v1.ListOptions) {
-		labelSelector, _ := labels.Parse(cliFlags.Selector)
+	cliFlags flags
+	// cliParams    params
+	podsGetter   typed_core_v1.PodInterface
+	eventsGetter typed_core_v1.EventInterface
+	logOptions   *v1.PodLogOptions = &v1.PodLogOptions{}
+	selector                       = func(options *meta_v1.ListOptions) {
+		labelSelector, _ := labels.Parse(cliFlags.selector)
 		options.LabelSelector = labelSelector.String()
 	}
-	now     int64
-	timeout time.Duration
+
+	timeout   time.Duration
+	timeStart timestamp
+	timeLag   float64
 )
 
 var rootCmd = &cobra.Command{
@@ -239,27 +294,31 @@ var rootCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 
-		if cliFlags.Kubeconfig == "" {
-			cliFlags.Kubeconfig = os.Getenv("KUBECONFIG")
+		if cliFlags.kubeconfig == "" {
+			cliFlags.kubeconfig = os.Getenv("KUBECONFIG")
 		}
 
 		var err error
 
-		timeout, err = time.ParseDuration(cliFlags.Timeout)
+		// cliParams.timeout, err = time.ParseDuration(cliFlags.timeout)
+		timeout, err = time.ParseDuration(cliFlags.timeout)
 		if err != nil {
 			return err
 		}
 
-		timeLag, err := time.ParseDuration(cliFlags.TimeLag)
+		lag, err := time.ParseDuration(cliFlags.timeLag)
 		if err != nil {
 			return err
 		}
 
-		now = time.Now().Add(-timeLag).Unix()
+		// cliParams.lag = timeLag.Seconds()
+		// cliParams.timestamp = timestamp(time.Now().Unix())
+		timeLag = lag.Seconds()
+		timeStart = timestamp(time.Now().Unix())
 
-		if cliFlags.HelmReleaseName == "" {
-			labelSelector, _ := labels.Parse(cliFlags.Selector)
-			cliFlags.HelmReleaseName, _ = labelSelector.RequiresExactMatch("app")
+		if cliFlags.helmReleaseName == "" {
+			labelSelector, _ := labels.Parse(cliFlags.selector)
+			cliFlags.helmReleaseName, _ = labelSelector.RequiresExactMatch("app")
 		}
 
 		return nil
@@ -267,12 +326,12 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&cliFlags.Kubeconfig, "kubeconfig", "", "path to kubeconfig")
-	rootCmd.PersistentFlags().StringVar(&cliFlags.Timeout, "timeout", "5m0s", "process timeout")
-	rootCmd.PersistentFlags().StringVar(&cliFlags.TimeLag, "time-lag", "1m0s", "max lag between proccess running time and pod creation time")
-	rootCmd.PersistentFlags().StringVarP(&cliFlags.Namespace, "namespace", "n", "default", "namespace")
-	rootCmd.PersistentFlags().StringVarP(&cliFlags.Selector, "selector", "l", "", "Selector (label query) to filter on")
-	rootCmd.PersistentFlags().StringVar(&cliFlags.HelmReleaseName, "helm-release-name", "", "Helm release name for deploy state checking")
+	rootCmd.PersistentFlags().StringVar(&cliFlags.kubeconfig, "kubeconfig", "", "path to kubeconfig")
+	rootCmd.PersistentFlags().StringVar(&cliFlags.timeout, "timeout", "5m0s", "process timeout")
+	rootCmd.PersistentFlags().StringVar(&cliFlags.timeLag, "time-lag", "30s", "max lag between proccess running time and kubernetes objects changed time")
+	rootCmd.PersistentFlags().StringVarP(&cliFlags.namespace, "namespace", "n", "default", "namespace")
+	rootCmd.PersistentFlags().StringVarP(&cliFlags.selector, "selector", "l", "", "Selector (label query) to filter on")
+	rootCmd.PersistentFlags().StringVar(&cliFlags.helmReleaseName, "helm-release-name", "", "Helm release name for deploy state checking")
 }
 
 func main() {
@@ -282,7 +341,7 @@ func main() {
 }
 
 func execute() error {
-	kubeconfig, err := ioutil.ReadFile(cliFlags.Kubeconfig)
+	kubeconfig, err := ioutil.ReadFile(cliFlags.kubeconfig)
 	if err != nil {
 		return err
 	}
@@ -297,9 +356,10 @@ func execute() error {
 		return err
 	}
 
-	podsGetter = clientset.CoreV1().Pods(cliFlags.Namespace)
+	podsGetter = clientset.CoreV1().Pods(cliFlags.namespace)
+	eventsGetter = clientset.CoreV1().Events(cliFlags.namespace)
 
-	podListWatcher := cache.NewFilteredListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", cliFlags.Namespace, selector)
+	podListWatcher := cache.NewFilteredListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", cliFlags.namespace, selector)
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
@@ -324,6 +384,7 @@ func execute() error {
 		},
 	}, cache.Indexers{})
 
+	// ctx, cancel := context.WithTimeout(context.Background(), cliParams.timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
